@@ -1,0 +1,7 @@
+mcp
+plaid-python
+python-dotenv
+fastapi
+sqlmodel
+httpx
+uvicorn
