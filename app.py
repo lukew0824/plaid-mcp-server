@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 import httpx
 import plaid
 from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, Response
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -250,31 +250,38 @@ async def plaid_link_page(session: str):
   <p id="status"></p>
   <script id="cfg" type="application/json">{config_json}</script>
   <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
-  <script>
-    (() => {{
-      const cfg = JSON.parse(document.getElementById('cfg').textContent);
-      const handler = Plaid.create({{
-        token: cfg.link_token,
-        onSuccess: async (public_token) => {{
-          document.getElementById('status').textContent = 'Connecting...';
-          const res = await fetch('/plaid/exchange', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{ public_token, session: cfg.session }})
-          }});
-          const data = await res.json();
-          if (data.redirect) window.location.href = data.redirect;
-        }},
-        onExit: (err) => {{
-          if (err) document.getElementById('status').textContent = 'Error: ' + err.display_message;
-        }}
-      }});
-      document.getElementById('link-btn').addEventListener('click', () => handler.open());
-    }})();
-  </script>
+  <script src="/plaid/link.js"></script>
 </body>
 </html>
 ''')
+
+
+_PLAID_LINK_JS = """(() => {
+  const cfg = JSON.parse(document.getElementById('cfg').textContent);
+  const handler = Plaid.create({
+    token: cfg.link_token,
+    onSuccess: async (public_token) => {
+      document.getElementById('status').textContent = 'Connecting...';
+      const res = await fetch('/plaid/exchange', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ public_token, session: cfg.session })
+      });
+      const data = await res.json();
+      if (data.redirect) window.location.href = data.redirect;
+    },
+    onExit: (err) => {
+      if (err) document.getElementById('status').textContent = 'Error: ' + err.display_message;
+    }
+  });
+  document.getElementById('link-btn').addEventListener('click', () => handler.open());
+})();
+"""
+
+
+@app.get('/plaid/link.js')
+async def plaid_link_js():
+    return Response(content=_PLAID_LINK_JS, media_type='application/javascript')
 
 
 @app.post('/plaid/exchange')
