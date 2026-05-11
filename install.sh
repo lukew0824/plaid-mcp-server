@@ -4,13 +4,21 @@ set -euo pipefail
 # plaid-mcp installer for Ubuntu 24.04 / Debian.
 # Run from the project directory after editing .env.
 
+if [[ $EUID -eq 0 ]]; then
+    echo "Error: do not run this script as root. The service should run as a normal user."
+    echo "Run as a regular user; the script will use sudo internally where needed."
+    exit 1
+fi
+
 if [[ ! -f .env ]]; then
     echo "Error: .env not found. Run 'cp .env.example .env' and fill in the values first."
     exit 1
 fi
 
-# shellcheck disable=SC2046
-export $(grep -v '^#' .env | grep -v '^$' | xargs -d '\n' -I {} echo {})
+set -a
+# shellcheck disable=SC1091
+source .env
+set +a
 
 if [[ -z "${BASE_URL:-}" ]]; then
     echo "Error: BASE_URL not set in .env"
@@ -51,6 +59,13 @@ echo "==> Writing /etc/caddy/Caddyfile for $DOMAIN"
 sudo tee /etc/caddy/Caddyfile >/dev/null <<EOF
 $DOMAIN {
     reverse_proxy localhost:8080
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self' https://cdn.plaid.com; connect-src 'self' https://*.plaid.com; frame-src https://*.plaid.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; base-uri 'none'"
+    }
 }
 EOF
 sudo systemctl reload caddy
@@ -68,6 +83,28 @@ WorkingDirectory=$PROJECT_DIR
 ExecStart=$PROJECT_DIR/.venv/bin/python app.py
 Restart=on-failure
 RestartSec=5
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=$PROJECT_DIR
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 
 [Install]
 WantedBy=multi-user.target

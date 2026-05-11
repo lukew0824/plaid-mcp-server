@@ -5,3 +5,5 @@ fastapi
 sqlmodel
 httpx
 uvicorn
+cryptography>=42.0.0
+slowapi>=0.1.9

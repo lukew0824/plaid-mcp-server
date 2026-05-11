@@ -33,6 +33,7 @@ class OAuthPendingRequest(SQLModel, table=True):
     redirect_uri: str
     code_challenge: str
     state: str
+    browser_binding_hash: str
     expires_at: datetime
 
 

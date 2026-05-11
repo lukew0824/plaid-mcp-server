@@ -1,4 +1,6 @@
 import hashlib
+import json
+import logging
 import os
 import secrets
 import base64
@@ -10,6 +12,9 @@ import httpx
 import plaid
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from plaid.api import plaid_api
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
@@ -24,6 +29,10 @@ from database import (
     init_db, get_db,
     User, PlaidToken, OAuthPendingRequest, OAuthAuthCode, OAuthToken,
 )
+from crypto_utils import encrypt_token, decrypt_token, hash_bearer
+
+logger = logging.getLogger('plaid-mcp.audit')
+logger.setLevel(logging.INFO)
 
 load_dotenv()
 
@@ -56,7 +65,11 @@ async def lifespan(app: FastAPI):
     async with mcp.session_manager.run():
         yield
 
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ── OAuth 2.1 discovery ────────────────────────────────────────────────────
@@ -79,6 +92,7 @@ async def oauth_metadata():
         'authorization_endpoint': f'{BASE_URL}/oauth/authorize',
         'token_endpoint': f'{BASE_URL}/oauth/token',
         'registration_endpoint': f'{BASE_URL}/oauth/register',
+        'revocation_endpoint': f'{BASE_URL}/oauth/revoke',
         'response_types_supported': ['code'],
         'grant_types_supported': ['authorization_code'],
         'code_challenge_methods_supported': ['S256'],
@@ -88,6 +102,7 @@ async def oauth_metadata():
 
 
 @app.post('/oauth/register')
+@limiter.limit("10/minute")
 async def oauth_register(request: Request):
     body = await request.json()
     return JSONResponse({
@@ -103,7 +118,9 @@ async def oauth_register(request: Request):
 # ── Step 1: Claude.ai sends user here ─────────────────────────────────────
 
 @app.get('/oauth/authorize')
+@limiter.limit("10/minute")
 async def oauth_authorize(
+    request: Request,
     response_type: str,
     client_id: str,
     redirect_uri: str,
@@ -111,12 +128,14 @@ async def oauth_authorize(
     code_challenge: str,
     code_challenge_method: str = 'S256',
 ):
+    logger.info("authorize_start client_id=%s ip=%s", client_id, request.client.host if request.client else 'unknown')
     if response_type != 'code':
         raise HTTPException(400, 'Only authorization_code flow supported')
     if code_challenge_method != 'S256':
         raise HTTPException(400, 'Only S256 PKCE supported')
 
     session_id = secrets.token_urlsafe(32)
+    browser_binding = secrets.token_urlsafe(32)
     with get_db() as db:
         db.add(OAuthPendingRequest(
             session_id=session_id,
@@ -124,7 +143,8 @@ async def oauth_authorize(
             redirect_uri=redirect_uri,
             code_challenge=code_challenge,
             state=state,
-            expires_at=utcnow() + timedelta(minutes=10),
+            browser_binding_hash=hash_bearer(browser_binding),
+            expires_at=utcnow() + timedelta(minutes=2),
         ))
         db.commit()
 
@@ -135,13 +155,26 @@ async def oauth_authorize(
         'scope': 'openid email',
         'state': session_id,
     }
-    return RedirectResponse('https://accounts.google.com/o/oauth2/v2/auth?' + urlencode(google_params))
+    response = RedirectResponse('https://accounts.google.com/o/oauth2/v2/auth?' + urlencode(google_params))
+    response.set_cookie(
+        key='plaid_mcp_binding',
+        value=browser_binding,
+        max_age=600,
+        httponly=True,
+        secure=True,
+        samesite='lax',
+    )
+    return response
 
 
 # ── Step 2: Google redirects back here ────────────────────────────────────
 
 @app.get('/auth/google/callback')
-async def google_callback(code: str, state: str):
+@limiter.limit("5/minute")
+async def google_callback(request: Request, code: str, state: str):
+    binding_cookie = request.cookies.get('plaid_mcp_binding')
+    if not binding_cookie:
+        raise HTTPException(400, 'Missing session binding')
     with get_db() as db:
         pending = db.exec(
             select(OAuthPendingRequest).where(
@@ -152,6 +185,8 @@ async def google_callback(code: str, state: str):
 
         if not pending:
             raise HTTPException(400, 'Invalid or expired session')
+        if pending.browser_binding_hash != hash_bearer(binding_cookie):
+            raise HTTPException(400, 'Session binding mismatch')
 
         async with httpx.AsyncClient() as http:
             token_res = await http.post('https://oauth2.googleapis.com/token', data={
@@ -173,7 +208,9 @@ async def google_callback(code: str, state: str):
         google_id = userinfo.get('sub')
 
         if email != ALLOWED_EMAIL:
+            logger.warning("auth_denied email=%s", email)
             raise HTTPException(403, 'Not authorized')
+        logger.info("auth_success email=%s", email)
 
         user = db.exec(select(User).where(User.google_id == google_id)).first()
         if not user:
@@ -202,6 +239,7 @@ async def plaid_link_page(session: str):
     ))
     link_token = link_token_res.link_token
 
+    config_json = json.dumps({'link_token': link_token, 'session': session}).replace('</', '<\\/')
     return HTMLResponse(f'''
 <!DOCTYPE html>
 <html>
@@ -210,25 +248,29 @@ async def plaid_link_page(session: str):
   <h2>One more step — connect your bank</h2>
   <button id="link-btn">Connect with Plaid</button>
   <p id="status"></p>
+  <script id="cfg" type="application/json">{config_json}</script>
   <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
   <script>
-    const handler = Plaid.create({{
-      token: '{link_token}',
-      onSuccess: async (public_token) => {{
-        document.getElementById('status').textContent = 'Connecting...';
-        const res = await fetch('/plaid/exchange', {{
-          method: 'POST',
-          headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{ public_token, session: '{session}' }})
-        }});
-        const data = await res.json();
-        if (data.redirect) window.location.href = data.redirect;
-      }},
-      onExit: (err) => {{
-        if (err) document.getElementById('status').textContent = 'Error: ' + err.display_message;
-      }}
-    }});
-    document.getElementById('link-btn').onclick = () => handler.open();
+    (() => {{
+      const cfg = JSON.parse(document.getElementById('cfg').textContent);
+      const handler = Plaid.create({{
+        token: cfg.link_token,
+        onSuccess: async (public_token) => {{
+          document.getElementById('status').textContent = 'Connecting...';
+          const res = await fetch('/plaid/exchange', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ public_token, session: cfg.session }})
+          }});
+          const data = await res.json();
+          if (data.redirect) window.location.href = data.redirect;
+        }},
+        onExit: (err) => {{
+          if (err) document.getElementById('status').textContent = 'Error: ' + err.display_message;
+        }}
+      }});
+      document.getElementById('link-btn').addEventListener('click', () => handler.open());
+    }})();
   </script>
 </body>
 </html>
@@ -236,10 +278,15 @@ async def plaid_link_page(session: str):
 
 
 @app.post('/plaid/exchange')
+@limiter.limit("5/minute")
 async def plaid_exchange(request: Request):
     body = await request.json()
     public_token = body['public_token']
     session_id = body['session']
+
+    binding_cookie = request.cookies.get('plaid_mcp_binding')
+    if not binding_cookie:
+        raise HTTPException(400, 'Missing session binding')
 
     with get_db() as db:
         pending = db.exec(
@@ -251,6 +298,8 @@ async def plaid_exchange(request: Request):
 
         if not pending:
             raise HTTPException(400, 'Invalid or expired session')
+        if pending.browser_binding_hash != hash_bearer(binding_cookie):
+            raise HTTPException(400, 'Session binding mismatch')
 
         exchange_res = _plaid_client.item_public_token_exchange(
             ItemPublicTokenExchangeRequest(public_token=public_token)
@@ -258,11 +307,12 @@ async def plaid_exchange(request: Request):
 
         user = db.exec(select(User).where(User.email == ALLOWED_EMAIL)).first()
         existing = db.exec(select(PlaidToken).where(PlaidToken.user_id == user.id)).first()
+        encrypted = encrypt_token(exchange_res.access_token)
         if existing:
-            existing.access_token = exchange_res.access_token
+            existing.access_token = encrypted
             db.add(existing)
         else:
-            db.add(PlaidToken(user_id=user.id, access_token=exchange_res.access_token))
+            db.add(PlaidToken(user_id=user.id, access_token=encrypted))
         db.commit()
 
         redirect_url = _issue_auth_code(db, user, pending, return_url=True)
@@ -272,7 +322,9 @@ async def plaid_exchange(request: Request):
 # ── Step 3: Claude.ai exchanges auth code for token ───────────────────────
 
 @app.post('/oauth/token')
+@limiter.limit("10/minute")
 async def oauth_token(
+    request: Request,
     grant_type: str = Form(),
     code: str = Form(),
     redirect_uri: str = Form(),
@@ -295,6 +347,8 @@ async def oauth_token(
 
         if auth_code.redirect_uri != redirect_uri:
             raise HTTPException(400, 'redirect_uri mismatch')
+        if auth_code.client_id != client_id:
+            raise HTTPException(400, 'client_id mismatch')
 
         computed = base64.urlsafe_b64encode(
             hashlib.sha256(code_verifier.encode()).digest()
@@ -305,18 +359,33 @@ async def oauth_token(
 
         access_token = secrets.token_urlsafe(32)
         db.add(OAuthToken(
-            token=access_token,
+            token=hash_bearer(access_token),
             user_id=auth_code.user_id,
             expires_at=utcnow() + timedelta(days=30),
         ))
         db.delete(auth_code)
         db.commit()
+        logger.info("token_issued user_id=%s", auth_code.user_id)
 
         return {
             'access_token': access_token,
             'token_type': 'bearer',
             'expires_in': 30 * 24 * 3600,
         }
+
+
+@app.post('/oauth/revoke')
+async def oauth_revoke(token: str = Form()):
+    """RFC 7009 token revocation."""
+    with get_db() as db:
+        existing = db.exec(
+            select(OAuthToken).where(OAuthToken.token == hash_bearer(token))
+        ).first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+    logger.info("token_revoked")
+    return JSONResponse({}, status_code=200)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -355,15 +424,17 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
                 )
 
             token = auth_header[7:]
+            token_hash = hash_bearer(token)
             with get_db() as db:
                 oauth_token = db.exec(
                     select(OAuthToken).where(
-                        OAuthToken.token == token,
+                        OAuthToken.token == token_hash,
                         OAuthToken.expires_at > utcnow(),
                     )
                 ).first()
 
                 if not oauth_token:
+                    logger.warning("invalid_bearer ip=%s", request.client.host if request.client else 'unknown')
                     return JSONResponse(
                         {'error': 'invalid_token'},
                         status_code=401,
@@ -377,7 +448,7 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
                 if not plaid_token:
                     return JSONResponse({'error': 'no_plaid_token'}, status_code=403)
 
-                plaid_token_ctx.set(plaid_token.access_token)
+                plaid_token_ctx.set(decrypt_token(plaid_token.access_token))
 
         return await call_next(request)
 
@@ -388,4 +459,4 @@ app.mount('/', mcp.streamable_http_app())
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8080)
+    uvicorn.run(app, host='127.0.0.1', port=8080)
