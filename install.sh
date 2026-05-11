@@ -85,9 +85,10 @@ Restart=on-failure
 RestartSec=5
 
 # Sandboxing
+# ProtectHome= intentionally omitted because the project lives under /home.
+# If you move the project to /opt or /srv, re-add: ProtectHome=true
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
