@@ -1,110 +1,234 @@
-# plaid-mcp
+<div align="center">
 
-A self-hosted [MCP](https://modelcontextprotocol.io) server that lets Claude query your bank accounts, balances, and transactions through [Plaid](https://plaid.com).
+# Plaid MCP Server
 
-## Tools
+**A self-hosted MCP server for securely querying personal financial data through Plaid.**
+
+Connect an MCP-compatible AI assistant to bank accounts, balances, transactions, merchants, and spending data while keeping Plaid credentials and access tokens on your own server.
+
+</div>
+
+---
+
+## Overview
+
+Plaid MCP Server exposes personal financial data through the Model Context Protocol (MCP), allowing an AI assistant to answer questions about connected bank accounts and transaction history.
+
+The server handles authentication, Plaid account linking, financial-data retrieval, and MCP tool execution behind a self-hosted API.
+
+Example queries:
+
+```text
+"What did I spend on food last month?"
+
+"Show me my largest purchases this week."
+
+"How much have I spent at Trader Joe's this year?"
+
+"What are my current account balances?"
+```
+
+## Available Tools
 
 | Tool | Description |
-|------|-------------|
-| `accounts` | All linked bank accounts |
-| `balances` | Current/available balances and credit limits |
-| `transactions` | Full transaction history for a date range |
-| `total_spending` | Total spending broken down by category |
-| `transactions_by_category` | Filter transactions by Plaid PFC category |
-| `merchants` | All merchants for a date range, sorted by total spend |
+| --- | --- |
+| `accounts` | List all linked bank accounts |
+| `balances` | Retrieve current and available balances and credit limits |
+| `transactions` | Retrieve transaction history for a specified date range |
+| `total_spending` | Calculate spending totals grouped by category |
+| `transactions_by_category` | Filter transactions by Plaid Personal Finance Category |
+| `merchants` | List merchants ranked by total spend over a date range |
 | `transactions_by_merchant` | Filter transactions by merchant name |
 
-## How it works
+## Architecture
 
-- **OAuth 2.1 + PKCE** with Google as the identity provider
-- **Email allowlist** is the security boundary
-- Claude.ai gets a 30-day bearer token; your Plaid access token never leaves your server
-- **Caddy** sits in front of FastAPI, terminating TLS on port 443 with auto-provisioned Let's Encrypt certs and reverse-proxying to `localhost:8080`
+```text
+┌──────────────────────┐
+│  MCP Client / AI     │
+└──────────┬───────────┘
+           │ HTTPS + MCP
+           ▼
+┌──────────────────────┐
+│        Caddy         │
+│   TLS / Reverse Proxy│
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐
+│       FastAPI        │
+│   MCP + OAuth Layer  │
+└───────┬───────┬──────┘
+        │       │
+        │       └──────────────► Google OAuth
+        │
+        ▼
+┌──────────────────────┐
+│        Plaid         │
+│ Accounts / Txns / PFC│
+└──────────────────────┘
+```
+
+### Authentication and Security
+
+- OAuth 2.1 + PKCE with Google as the identity provider
+- Email allowlist controls access to the server
+- Plaid access tokens remain on the self-hosted server
+- MCP clients receive a time-limited bearer token
+- Caddy terminates TLS and reverse-proxies traffic to FastAPI
+- HTTPS certificates are automatically provisioned through Let's Encrypt
+
+## Tech Stack
+
+**Backend:** Python, FastAPI  
+**Protocol:** Model Context Protocol (MCP)  
+**Financial data:** Plaid API  
+**Authentication:** Google OAuth 2.1 + PKCE  
+**Storage:** SQLite  
+**Infrastructure:** AWS EC2, Caddy, systemd  
+**Transport:** HTTPS
 
 ## Requirements
 
-- A Linux server with a public IP (this guide uses an AWS EC2 `t3.micro`)
-- A domain name pointing at it (this guide uses a free DuckDNS subdomain)
-- A Plaid developer account with **production access**
-- A Google Cloud account for the OAuth client
+Before deploying, you'll need:
+
+- A Linux server with a public IP
+- A domain or subdomain pointing to the server
+- A Plaid developer account with Production access
+- A Google Cloud project with OAuth credentials
+
+The setup below uses an AWS EC2 `t3.micro` instance and DuckDNS, but equivalent infrastructure should work as well.
 
 ## Setup
 
 ### 1. Plaid
 
-1. Create a Plaid account at [dashboard.plaid.com](https://dashboard.plaid.com)
-2. Request **Production access** in the dashboard (Plaid will review your application — this can take a few days)
-3. Once approved, save your `client_id` and `Production` secret from **Team Settings → Keys**
+1. Create a Plaid developer account.
+2. Request Production access through the Plaid dashboard.
+3. Once approved, save your:
+   - `client_id`
+   - Production secret
 
 ### 2. Google OAuth
 
-1. [console.cloud.google.com](https://console.cloud.google.com) → create a project
-2. **APIs & Services → OAuth consent screen** → set up an "External" app, add yourself as a test user
-3. **APIs & Services → Credentials → Create credentials → OAuth client ID**
-4. Application type: **Web application**
-5. **Authorized redirect URIs**: `https://yourdomain.com/auth/google/callback` *(use your real domain from step 4 below)*
-6. Save the `Client ID` and `Client secret`
+Create a Google Cloud project and configure an OAuth client.
+
+Use the following redirect URI:
+
+```text
+https://yourdomain.com/auth/google/callback
+```
+
+Save the generated:
+
+- Client ID
+- Client secret
 
 ### 3. Server
 
-This guide assumes AWS EC2:
+This example uses Ubuntu on AWS EC2.
 
-1. Launch a `t3.micro` Ubuntu 24.04 instance
-2. Security group: inbound TCP **22** (SSH from your IP), **80**, **443**
-3. **Allocate** an Elastic IP and **associate** it with the instance
-4. SSH in: `ssh -i your-key.pem ubuntu@<elastic-ip>`
+1. Launch an Ubuntu 24.04 instance.
+2. Allow inbound traffic on:
+   - `22` for SSH
+   - `80` for HTTP
+   - `443` for HTTPS
+3. Associate a stable public IP with the instance.
+4. Connect over SSH.
+
+```bash
+ssh -i your-key.pem ubuntu@<server-ip>
+```
 
 ### 4. Domain
 
-Free option using [DuckDNS](https://www.duckdns.org):
+Point a domain or subdomain at your server's public IP.
 
-1. Sign in with Google/GitHub/Reddit
-2. Reserve a subdomain (e.g. `plaid-yourname`)
-3. Set the IP to your Elastic IP
-4. Your domain is now `plaid-yourname.duckdns.org`
+For a free option, DuckDNS works well:
 
-Go back to step 2.5 and set the redirect URI to `https://plaid-yourname.duckdns.org/auth/google/callback`.
+```text
+plaid-yourname.duckdns.org
+```
+
+Then use:
+
+```text
+https://plaid-yourname.duckdns.org/auth/google/callback
+```
+
+as the Google OAuth redirect URI.
 
 ### 5. Install
 
-On the server:
+Clone the repository:
 
 ```bash
-git clone https://github.com/lukew0824/plaid-mcp.git
-cd plaid-mcp
+git clone https://github.com/lukew0824/plaid-mcp-server.git
+cd plaid-mcp-server
+```
+
+Create your environment file:
+
+```bash
 cp .env.example .env
-nano .env   # fill in everything
+nano .env
+```
+
+Fill in the required values, then run:
+
+```bash
 ./install.sh
 ```
 
-The script:
-- Installs Python, Caddy, and dependencies
-- Sets up and starts a systemd service (`plaid-mcp`) that auto-restarts on failure and boot
-- Configures Caddy as a reverse proxy with auto-HTTPS via Let's Encrypt
+The installer:
 
-### 6. Connect in Claude.ai
+- Installs Python dependencies and Caddy
+- Creates a `systemd` service
+- Configures the application to restart automatically
+- Configures Caddy as an HTTPS reverse proxy
 
-1. Claude.ai → **Settings → Connectors → Add custom connector**
-2. URL: `https://yourdomain.com/mcp`
-3. Click **Connect**
-4. Sign in with the Google account matching `ALLOWED_EMAIL`
-5. **First time only**: a Plaid Link popup will appear — connect your bank
-6. Done. Try: *"What did I spend on food last month?"*
+### 6. Connect an MCP Client
+
+For Claude.ai:
+
+1. Open **Settings → Connectors**
+2. Add a custom connector
+3. Set the URL to:
+
+```text
+https://yourdomain.com/mcp
+```
+
+4. Authenticate using the Google account configured in `ALLOWED_EMAIL`
+5. Complete Plaid Link the first time you connect a financial institution
+
+Once connected, the financial tools will be available to the MCP client.
 
 ## Configuration
 
-The `.env` values:
+| Variable | Description |
+| --- | --- |
+| `PLAID_ENV` | Plaid environment, typically `production` |
+| `PLAID_CLIENT_ID` | Plaid client ID |
+| `PLAID_PRODUCTION_SECRET` | Plaid Production secret |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+| `ALLOWED_EMAIL` | Google account permitted to authenticate |
+| `BASE_URL` | Public HTTPS URL of the server |
+| `DATABASE_URL` | Database connection string; SQLite works by default |
 
-| Key | Description |
-|-----|-------------|
-| `PLAID_ENV` | `production` |
-| `PLAID_CLIENT_ID` | From Plaid dashboard |
-| `PLAID_PRODUCTION_SECRET` | From Plaid dashboard |
-| `GOOGLE_CLIENT_ID` | From Google Cloud Console |
-| `GOOGLE_CLIENT_SECRET` | From Google Cloud Console |
-| `ALLOWED_EMAIL` | The single Google email allowed to authenticate |
-| `BASE_URL` | Public HTTPS URL of this server (no trailing slash) |
-| `DATABASE_URL` | `sqlite:///./plaid_mcp.db` (default works for self-hosting) |
+## Project Structure
+
+```text
+plaid-mcp-server/
+├── app.py
+├── crypto_utils.py
+├── database.py
+├── plaid_client.py
+├── tools.py
+├── install.sh
+├── requirements.txt
+├── .env.example
+└── README.md
+```
 
 ## License
 
